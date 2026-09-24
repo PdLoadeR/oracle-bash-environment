@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #============================================================================================================================
 # Filename:     dba_ora_clean.sh
-# Version:      v.2.7
+# Version:      v.2.8.1
 # Author:       Parsa Bahrami (pb)
 # Purpose:      Safe Oracle database-server cleanup with preflight, scoped execution, timeouts,
 #               locking, ADRCI error detection, and per-database environment validation.
@@ -71,6 +71,8 @@
 # 20260924      2.5       pb      Limited processing to active SID/oratab homes and approved ADR home types
 # 20260924      2.6       pb      Restored AUDIT_FILE_DEST, CRS EVM, and listener XML filesystem cleanup
 # 20260924      2.7       pb      Resolve audit directory from V$PARAMETER instead of assuming ORACLE_SID
+# 20260924      2.8       pb      Added aligned SQL/ADRCI output and screen-only status colors
+# 20260924      2.8.1     pb      Color only the status tag, not the full line
 #
 #---------------------------------------------------------------------------------------------------------------------------
 # Credit:
@@ -80,7 +82,7 @@
 set -uo pipefail
 IFS=$'\n\t'
 umask 027
-VERSION=2.7.0
+VERSION=2.8.1
 MODE=preflight
 SCOPE=all
 ALLOW_MIGRATE=false
@@ -94,6 +96,8 @@ LOG_DIR="$SCRIPT_DIR/../log"
 RUN_ID=$(date +%Y%m%d_%H%M%S)_$$
 WORK_DIR=""
 LOG_FILE=""
+LOG_FD_READY=false
+USE_COLOR=false
 ADR_DAYS=32
 ORACLE_HOME_AUD_DAYS=2
 ADUMP_AUD_DAYS=2
@@ -120,13 +124,68 @@ FILES=0
 DIRS=0
 BYTES=0
 #-------------------------------- Logging and status ---------------------------------------------
-log() {
-    printf '[%s] %-9s %s\n' "$(date '+%F %T')" "$1" "$2"
+# Return the terminal color for a status tag.
+# Colors are written only to the interactive screen. The file log remains plain text.
+status_color() {
+    local status="$1"
+
+    case "$status" in
+        START)   printf '\033[94m' ;;  # Light blue
+        SUCCESS) printf '\033[92m' ;;  # Light green
+        WARNING) printf '\033[93m' ;;  # Yellow
+        FAILED)  printf '\033[91m' ;;  # Light red
+        INFO | PLAN | OUTPUT | SUMMARY)
+                 printf '\033[0m' ;;
+        TIMEOUT) printf '\033[91m' ;;  # Light red
+        *)       printf '\033[0m'  ;;
+    esac
 }
+
+# Write one aligned message to the screen and the plain-text log file.
+# Screen format can contain ANSI color. File format never contains ANSI sequences.
+log() {
+    local status="$1"
+    local message="$2"
+    local timestamp
+    local plain_line
+    local color
+    local reset='\033[0m'
+
+    timestamp=$(date '+%F %T')
+    printf -v plain_line '[%s] %-9s %s' "$timestamp" "$status" "$message"
+
+    if [[ "$USE_COLOR" == "true" ]]; then
+        color=$(status_color "$status")
+        printf '[%s] %b%-9s%b %s\n' "$timestamp" "$color" "$status" "$reset" "$message"
+    else
+        printf '%s\n' "$plain_line"
+    fi
+
+    if [[ "$LOG_FD_READY" == "true" ]]; then
+        printf '%s\n' "$plain_line" >&4
+    fi
+}
+
 fail() {
     RETURN_CODE=1
     log FAILED "$1"
 }
+
+# Format captured ADRCI or SQLPlus output using the same timestamp/status columns.
+# Blank lines are omitted because they add noise without adding diagnostic value.
+log_output_file() {
+    local source="$1"
+    local file="$2"
+    local line
+
+    [[ -r "$file" ]] || return 0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] || continue
+        log OUTPUT "[$source] $line"
+    done < "$file"
+}
+
 usage() {
     cat <<EOF
 ====================================================================================================
@@ -174,6 +233,14 @@ DATABASE AND ADR RETENTION
 AUDIT FILE DESTINATION
     The script queries V\$PARAMETER.AUDIT_FILE_DEST for each running database.
     It does not assume that the directory is based on ORACLE_SID, DB_NAME, or DB_UNIQUE_NAME.
+
+LOG DISPLAY
+    Interactive screen output uses status colors:
+      START light blue, SUCCESS green, WARNING yellow, FAILED/TIMEOUT light red,
+      and INFO/PLAN/OUTPUT/SUMMARY white.
+
+    The log file is always plain text and contains no ANSI color sequences.
+    Set NO_COLOR=1 to disable screen colors.
 
 EXAMPLES
     $(basename "$0") --preflight
@@ -225,7 +292,15 @@ init() {
     LOG_DIR=$(cd "$LOG_DIR" && pwd -P)
     LOG_FILE="$LOG_DIR/ora_clean_${HOST_SHORT}.${RUN_ID}.log"
     WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/dba_ora_clean.${RUN_ID}.XXXX") || exit 73
-    exec > >(tee -a "$LOG_FILE") 2>&1
+    # Preserve the original terminal output while writing clean, uncolored log lines to FD 4.
+    exec 4>>"$LOG_FILE"
+    LOG_FD_READY=true
+
+    # Enable colors only for an interactive terminal. NO_COLOR disables them explicitly.
+    if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+        USE_COLOR=true
+    fi
+
     trap cleanup EXIT
     exec 9>"/var/tmp/dba_ora_clean.${HOST_SHORT}.lock"
     flock -n 9 || { log FAILED "Another cleanup is running"
@@ -412,7 +487,7 @@ SQL
 
     if (( rc != 0 )); then
         log FAILED "Unable to query AUDIT_FILE_DEST for ORACLE_SID=$ORACLE_SID rc=$rc"
-        sed "s/^/[SQL $ORACLE_SID AUDIT_FILE_DEST] /" "$output_file"
+        log_output_file "SQL $ORACLE_SID AUDIT_FILE_DEST" "$output_file"
         return "$rc"
     fi
 
@@ -533,7 +608,7 @@ adr_discover() {
     rc=$?
     if ((rc))
     then log FAILED "ADR discovery failed for base=$b rc=$rc"
-    sed 's/^/[ADRCI] /' "$raw"
+    log_output_file "ADRCI" "$raw"
     continue
 fi
 awk -v b="$b" '/^ADR Homes:/{f=1;next} f{gsub(/^[ \t]+|[ \t]+$/,"");if($0~/^diag\//)print b"|"$0}' "$raw" >>"$out"
@@ -564,7 +639,7 @@ adr_run() {
     log START "$label [$base/$home]"
     timeout --signal=TERM --kill-after=30s "$t" env ORACLE_HOME="$oh" ORACLE_BASE="$base" PATH="$oh/bin:$PATH" "$bin" exec="set base ${base}; set homepath ${home}; ${cmd}" >"$out" 2>&1
     rc=$?
-    sed 's/^/[ADRCI] /' "$out"
+    log_output_file "ADRCI" "$out"
     ADR_LAST=$out
     if grep -Eq '(^|[[:space:]])(DIA-|ORA-|SP2-)|Linux-.*Error:|Permission denied' "$out"
     then semantic=1
@@ -686,7 +761,7 @@ SQL
 f="$WORK_DIR/check.${ORACLE_SID}.out"
 timeout --signal=TERM --kill-after=30s 60 env ORACLE_SID="$ORACLE_SID" ORACLE_HOME="$ORACLE_HOME" ORACLE_BASE="$ORACLE_BASE" PATH="$ORACLE_HOME/bin:$PATH" "$ORACLE_HOME/bin/sqlplus" -s -L '/ as sysdba' @"$check" >"$f" 2>&1
 rc=$?
-sed "s/^/[SQL $ORACLE_SID PRECHECK] /" "$f"
+log_output_file "SQL $ORACLE_SID PRECHECK" "$f"
 if ((rc!=0)) || ! grep -Eq '^[[:space:]]*(OPEN|MOUNTED|STARTED)[[:space:]]*$' "$f"
 then log FAILED "Database precheck failed detected_SID=$sid ORACLE_SID=$ORACLE_SID rc=$rc; skipping all cleanup operations"
 DB_FAIL=$((DB_FAIL+1))
@@ -704,7 +779,7 @@ do f="$WORK_DIR/sql.$ORACLE_SID.$u.out"
 log START "$u cleanup SID=$ORACLE_SID"
 timeout --signal=TERM --kill-after=30s "$SQL_TIMEOUT" env ORACLE_SID="$ORACLE_SID" ORACLE_HOME="$ORACLE_HOME" ORACLE_BASE="$ORACLE_BASE" PATH="$ORACLE_HOME/bin:$PATH" "$ORACLE_HOME/bin/sqlplus" -s -L '/ as sysdba' @"$WORK_DIR/$u.sql" >"$f" 2>&1
 rc=$?
-sed "s/^/[SQL $ORACLE_SID] /" "$f"
+log_output_file "SQL $ORACLE_SID" "$f"
 case $rc in 0)log SUCCESS "$u cleanup SID=$ORACLE_SID";;124|137)log TIMEOUT "$u cleanup SID=$ORACLE_SID"
 DB_TIMEOUTS=$((DB_TIMEOUTS+1))
 bad=1
