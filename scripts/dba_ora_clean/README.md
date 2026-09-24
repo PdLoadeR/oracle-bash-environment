@@ -1,146 +1,306 @@
-# DBA Oracle Cleanup Framework (v2.7)
+# DBA Oracle Cleanup Framework
+
+Production-oriented Oracle database server housekeeping with safe preflight validation, scoped execution, structured logging, timeout protection, and automated Oracle environment discovery.
+
+Current release: **v2.8.1**
 
 ## Overview
 
-`dba_ora_clean.sh` is a production-grade Oracle server cleanup framework designed for enterprise database environments.
+`dba_ora_clean.sh` is a single-file Bash framework for cleaning Oracle database servers without requiring companion configuration files or libraries.
 
-The framework was rewritten from the original cleanup utility to provide:
+The framework supports:
 
-- Safe execution by default
-- Preflight validation mode
-- Scoped execution by cleanup category
-- Oracle environment auto-discovery
-- ADRCI-based diagnostic cleanup
-- Database audit cleanup
-- OEM agent cleanup
-- Filesystem cleanup
-- Locking and timeout protection
-- Detailed operational logging
+- Active Oracle Home filesystem cleanup
+- Database operating-system audit cleanup using the actual `AUDIT_FILE_DEST`
+- CRS EVM log cleanup
+- Listener XML alert cleanup
+- ADRCI-managed diagnostic cleanup
+- OEM Agent cleanup
+- Traditional audit trail cleanup
+- Scheduler log cleanup
+- Unified Audit Trail cleanup
+- Preflight and apply modes
+- Phase-specific execution
+- Plain-text file logging with screen-only status colors
 
-The entire solution is contained in a single portable Bash script.
+## Safety model
 
----
+The script is designed to favor safety and reviewability over aggressive cleanup.
 
-# Key Features
+Key safeguards include:
 
-## Safety First
+- Preflight is the default mode
+- No cleanup occurs unless `--apply` is supplied
+- A non-blocking lock prevents overlapping executions
+- Filesystem, ADRCI, and SQLPlus operations use timeouts
+- Filesystem operations validate paths before deletion
+- Filesystem searches stay on the current filesystem with `find -xdev`
+- ADR-managed content is purged through ADRCI rather than direct deletion
+- ADRCI output is inspected for semantic failures such as `DIA-`, `ORA-`, `SP2-`, Linux errors, and permission errors
+- Database cleanup requires a successful local connection and `OPEN` instance status
+- Automatic ADR schema migration is disabled unless explicitly requested
+- Cleanup failures are recorded while remaining targets continue unless `--stop-on-error` is supplied
 
-The framework uses multiple layers of protection:
+## Requirements
 
-- Preflight mode is the default
-- File locking prevents concurrent execution
-- ADRCI timeouts
-- SQLPlus timeouts
-- Filesystem scan timeouts
-- Database OPEN state validation
-- Active Oracle Home filtering
-- Explicit ADRCI error detection
-- Optional stop-on-error behavior
+Run the script as the Oracle software owner on a Linux host with:
 
----
+- Bash
+- `/etc/oratab`
+- SQLPlus in each active database Oracle Home
+- ADRCI in an active database or Grid Oracle Home
+- Standard utilities including `awk`, `find`, `flock`, `grep`, `ps`, `stat`, `timeout`, and `xargs`
 
-# Cleanup Components
+The executing account must have permission to access the selected files and connect locally to each database using:
 
-## 1. Filesystem Cleanup
+```bash
+sqlplus -s -L '/ as sysdba'
+```
 
-### Oracle Home Audit Files
+## Installation
+
+Copy the script to the desired operational directory and make it executable:
+
+```bash
+chmod 750 dba_ora_clean.sh
+```
+
+Validate the Bash syntax before the first run:
+
+```bash
+bash -n dba_ora_clean.sh
+```
+
+## Usage
+
+```bash
+./dba_ora_clean.sh [--preflight | --apply] [OPTIONS]
+```
+
+Display the built-in help:
+
+```bash
+./dba_ora_clean.sh --help
+```
+
+### Execution modes
+
+#### Preflight
+
+Preflight reports planned work without deleting files, purging ADR content, or changing database data.
+
+```bash
+./dba_ora_clean.sh --preflight
+```
+
+Preflight is the default, so this is equivalent:
+
+```bash
+./dba_ora_clean.sh
+```
+
+#### Apply
+
+Run all cleanup phases:
+
+```bash
+./dba_ora_clean.sh --apply
+```
+
+## Scope-specific execution
+
+### Filesystem only
+
+Preflight:
+
+```bash
+./dba_ora_clean.sh --preflight --only filesystem
+```
+
+Apply:
+
+```bash
+./dba_ora_clean.sh --apply --only filesystem
+```
+
+### OEM only
+
+Preflight:
+
+```bash
+./dba_ora_clean.sh --preflight --only oem
+```
+
+Apply:
+
+```bash
+./dba_ora_clean.sh --apply --only oem
+```
+
+### ADR only
+
+Preflight:
+
+```bash
+./dba_ora_clean.sh --preflight --only adr
+```
+
+Apply:
+
+```bash
+./dba_ora_clean.sh --apply --only adr
+```
+
+### Database only
+
+Preflight:
+
+```bash
+./dba_ora_clean.sh --preflight --only database
+```
+
+Apply:
+
+```bash
+./dba_ora_clean.sh --apply --only database
+```
+
+## Additional options
+
+### Stop on first error
+
+By default, the script records a failure and continues with the remaining targets.
+
+```bash
+./dba_ora_clean.sh --apply --stop-on-error
+```
+
+### Custom log directory
+
+```bash
+./dba_ora_clean.sh \
+    --preflight \
+    --log-dir /u01/app/oracle/admin/cleanup_logs
+```
+
+### Allow ADR schema migration
+
+ADRCI schema migration is disabled by default. Enable it only when intentionally handling `DIA-49803`:
+
+```bash
+./dba_ora_clean.sh \
+    --apply \
+    --only adr \
+    --allow-adr-schema-migration
+```
+
+### Disable screen colors
+
+```bash
+NO_COLOR=1 ./dba_ora_clean.sh --preflight
+```
+
+Colors are automatically disabled when output is not attached to an interactive terminal.
+
+## Active Oracle Home selection
+
+Filesystem cleanup and ADR base discovery operate only on Oracle Homes that meet all three conditions:
+
+1. A running database or ASM PMON process exists.
+2. The detected SID has a matching uncommented entry in `/etc/oratab`.
+3. The referenced Oracle Home exists on the filesystem.
+
+The script logs both inventories:
+
+```text
+Registered Oracle homes from /etc/oratab: ...
+Active Oracle homes selected for cleanup: ...
+```
+
+This avoids processing unrelated or inactive software homes, including standalone GoldenGate homes, while preserving valid database and Grid homes.
+
+## SID discovery
+
+Running instances are discovered from PMON process command names. This supports environments where `ORACLE_SID`, `DB_NAME`, and `DB_UNIQUE_NAME` do not use identical values.
+
+The discovered SID is matched case-insensitively against `/etc/oratab` to resolve the exact SID spelling and Oracle Home.
+
+## Cleanup coverage and retention
+
+| Area | Target | Default retention |
+|---|---|---:|
+| Oracle Home audit | `$ORACLE_HOME/rdbms/audit/*.aud` | 2 days |
+| Database OS audit | Files under the queried `AUDIT_FILE_DEST` | 2 days |
+| Oracle Home traces | `$ORACLE_HOME/rdbms/log/*.trc` | 32 days |
+| CRS EVM logs | `$ORACLE_BASE/crsdata/<hostname>/evm/evmlog*` | 32 days |
+| Listener XML files | `$ORACLE_BASE/diag/tnslsnr/<hostname>/**/*.xml` | 2 days |
+| ADR content | Approved ADR home families through ADRCI | 32 days |
+| OEM Agent files | Dumps, archived logs, and incidents | 14 days |
+| Script logs | `ora_clean_*` in the selected log directory | 14 days |
+| Traditional audit | `SYS.AUD$` | 365 days |
+| Unified audit | Unified Audit Trail | 365 days |
+| Scheduler logs | Job and window logs | 0 days |
+
+Retention values are defined near the beginning of the script and can be reviewed before deployment.
+
+## Filesystem cleanup
+
+### Oracle Home audit and trace files
+
+For each active Oracle Home, the filesystem phase scans:
 
 ```text
 $ORACLE_HOME/rdbms/audit/*.aud
-```
-
-Retention:
-
-```text
-2 days
-```
-
-### Oracle Home Trace Files
-
-```text
 $ORACLE_HOME/rdbms/log/*.trc
 ```
 
-Retention:
+### Database `AUDIT_FILE_DEST`
 
-```text
-32 days
-```
+The script does not construct the adump path from `ORACLE_SID`.
 
-### Database Audit Files (AUDIT_FILE_DEST)
-
-The framework does NOT assume:
-
-```text
-$ORACLE_BASE/admin/<SID>/adump
-```
-
-Instead it dynamically queries:
+For each running non-ASM database, it connects locally and queries:
 
 ```sql
-select value
-from v$parameter
-where name='audit_file_dest';
+SELECT TRIM(value)
+  FROM v$parameter
+ WHERE name = 'audit_file_dest';
 ```
 
-This supports:
+The returned path must be absolute before the filesystem cleanup engine will process it. This supports environments where the audit directory follows `DB_NAME`, `DB_UNIQUE_NAME`, or a custom naming convention.
 
-- SID != DB_NAME
-- DB_UNIQUE_NAME conventions
-- Custom audit directories
-- Future Oracle deployments
+### CRS EVM logs
 
-Retention:
+The script scans the EVM directory beneath each unique active Oracle Base:
 
 ```text
-2 days
+$ORACLE_BASE/crsdata/<hostname>/evm
 ```
 
-### CRS EVM Logs
+### Listener XML files
 
-```text
-$ORACLE_BASE/crsdata/<hostname>/evm/evmlog*
-```
-
-Retention:
-
-```text
-32 days
-```
-
-### Listener XML Alert Files
+The script recursively scans XML files beneath:
 
 ```text
 $ORACLE_BASE/diag/tnslsnr/<hostname>
 ```
 
-Retention:
+### Filesystem deletion behavior
 
-```text
-2 days
-```
+The filesystem engine:
 
-### Script Execution Logs
+- Validates each target directory
+- Uses `find -xdev`
+- Applies a timeout to each scan
+- Calculates candidate count and byte total
+- Reports the plan in both preflight and apply modes
+- Removes files in batches of 1,000
+- Removes matching directories in batches of 100
 
-Retention:
+## ADRCI cleanup
 
-```text
-14 days
-```
+ADRCI is selected from an active database or Grid Oracle Home. ADR bases are derived only from active Oracle Homes, preventing invalid bases from unrelated product homes.
 
----
-
-## 2. ADRCI Cleanup
-
-ADRCI manages diagnostic repository content.
-
-Retention:
-
-```text
-32 days
-```
-
-### Allowed ADR Families
+### Approved ADR home families
 
 ```text
 diag/rdbms/*
@@ -151,7 +311,9 @@ diag/clients/*
 diag/kfod/*
 ```
 
-### Excluded ADR Families
+### ADR families discovered but skipped
+
+Examples include:
 
 ```text
 diag/asmcmd/*
@@ -159,24 +321,36 @@ diag/asmtool/*
 diag/orapwd/*
 ```
 
-### Schema Migration
+The allowlist is based on the ADR home family, not on database-name patterns. Valid custom database names remain eligible under `diag/rdbms`.
 
-Disabled by default.
+### ADR semantic error detection
 
-Can be enabled explicitly:
+An ADRCI process can return a successful operating-system exit code while printing an ADR error. The script treats output containing the following patterns as a failed operation:
 
-```bash
-./dba_ora_clean.sh \
-  --apply \
-  --only adr \
-  --allow-adr-schema-migration
+```text
+DIA-
+ORA-
+SP2-
+Linux-* Error:
+Permission denied
 ```
 
----
+### Root-owned ADR homes
 
-## 3. OEM Agent Cleanup
+When the script runs as the Oracle software owner, root-owned ADR homes can produce permission errors such as:
 
-Removes:
+```text
+DIA-48191
+Permission denied
+```
+
+These failures are logged. Processing continues unless `--stop-on-error` is enabled.
+
+## OEM Agent cleanup
+
+OEM Agent homes are discovered from `/etc/oragchomelist`.
+
+The OEM phase scans:
 
 ```text
 heapdump*.phd
@@ -187,268 +361,224 @@ javacore*.txt
 incdir_*
 ```
 
-Retention:
+Missing OEM Agent paths are reported and skipped safely.
 
-```text
-14 days
-```
+## Database cleanup
 
----
+Database cleanup excludes ASM and management database instances. Each remaining database must pass a SQLPlus precheck and report `OPEN` before cleanup begins.
 
-## 4. Database Cleanup
+### Traditional audit trail
 
-### Traditional Audit Trail
-
-Target:
+The script removes rows older than the configured retention from:
 
 ```sql
 SYS.AUD$
 ```
 
-Retention:
+Deletion is performed in batches of 10,000 rows with a commit after each batch.
 
-```text
-365 days
-```
+### Scheduler logs
 
-Deletes occur in batches of:
-
-```text
-10,000 rows
-```
-
-### Scheduler Log Cleanup
-
-Target:
+The script calls:
 
 ```sql
 DBMS_SCHEDULER.PURGE_LOG
 ```
 
-### Unified Audit Cleanup
+for job and window logs.
 
-Target:
+### Unified Audit Trail
+
+The script uses:
 
 ```sql
-DBMS_AUDIT_MGMT
+DBMS_AUDIT_MGMT.SET_LAST_ARCHIVE_TIMESTAMP
+DBMS_AUDIT_MGMT.CLEAN_AUDIT_TRAIL
 ```
 
-Retention:
+with the configured database audit retention.
 
-```text
-365 days
-```
+## Logging
 
----
+### Log file
 
-# Active Oracle Home Selection (v2.5+)
-
-The framework only processes Oracle Homes that satisfy ALL of the following:
-
-1. Running PMON process exists
-2. Matching uncommented entry exists in `/etc/oratab`
-3. Oracle Home exists on disk
-
-This prevents processing unrelated homes such as:
-
-- GoldenGate homes
-- Inactive APEX homes
-- Decommissioned homes
-- Stale OOP patching homes
-
-The script reports:
-
-```text
-Registered Oracle homes from /etc/oratab
-Active Oracle homes selected for cleanup
-```
-
----
-
-# Execution Modes
-
-## Preflight (Default)
-
-No files removed.
-No database changes.
-No ADR changes.
-
-```bash
-./dba_ora_clean.sh --preflight
-```
-
----
-
-## Full Cleanup
-
-```bash
-./dba_ora_clean.sh --apply
-```
-
----
-
-# Scope-Based Execution
-
-## Filesystem Only
-
-```bash
-./dba_ora_clean.sh --preflight --only filesystem
-./dba_ora_clean.sh --apply --only filesystem
-```
-
-## OEM Only
-
-```bash
-./dba_ora_clean.sh --preflight --only oem
-./dba_ora_clean.sh --apply --only oem
-```
-
-## ADR Only
-
-```bash
-./dba_ora_clean.sh --preflight --only adr
-./dba_ora_clean.sh --apply --only adr
-```
-
-## Database Only
-
-```bash
-./dba_ora_clean.sh --preflight --only database
-./dba_ora_clean.sh --apply --only database
-```
-
----
-
-# Validation Workflow
-
-Recommended process for any production deployment.
-
-## Step 1
-
-Validate syntax:
-
-```bash
-bash -n dba_ora_clean.sh
-```
-
-## Step 2
-
-Review full plan:
-
-```bash
-./dba_ora_clean.sh --preflight
-```
-
-## Step 3
-
-Validate individual phases:
-
-```bash
-./dba_ora_clean.sh --preflight --only filesystem
-./dba_ora_clean.sh --preflight --only oem
-./dba_ora_clean.sh --preflight --only adr
-./dba_ora_clean.sh --preflight --only database
-```
-
-## Step 4 - Option 1
-
-Apply phases individually.
-
-```bash
-./dba_ora_clean.sh --apply --only filesystem
-./dba_ora_clean.sh --apply --only oem
-./dba_ora_clean.sh --apply --only adr
-./dba_ora_clean.sh --apply --only database
-```
-
-## Step 4 - Option 2
-
-Run complete cleanup.
-
-```bash
-./dba_ora_clean.sh --apply
-```
-
----
-
-# Logging
-
-Default location:
+The default log directory is:
 
 ```text
 ../log
 ```
 
-Example:
+relative to the script directory.
+
+Log filenames follow this pattern:
 
 ```text
-ora_clean_server01.20260924_120000.log
+ora_clean_<hostname>.<timestamp>_<pid>.log
 ```
 
-Custom location:
+File logs are always plain text and never contain ANSI color sequences.
 
-```bash
-./dba_ora_clean.sh \
-    --preflight \
-    --log-dir /u01/admin/cleanup_logs
-```
+### Structured command output
 
----
-
-# Known Behaviors
-
-### Root-Owned ADR Homes
-
-Can generate:
+SQLPlus and ADRCI output is normalized into the same aligned format as framework messages:
 
 ```text
-DIA-48191
-Permission denied
+[2026-09-24 15:31:20] OUTPUT    [ADRCI] DIA-48191: user missing read or write permission
+[2026-09-24 15:31:22] OUTPUT    [SQL SH1PRD PRECHECK] OPEN
+[2026-09-24 15:31:22] OUTPUT    [SQL SH1PRD] AUDIT_ROWS_DELETED=0
 ```
 
-These are reported and processing continues.
+Blank SQLPlus and ADRCI lines are omitted.
 
-### DIA-49803
+### Screen-only tag colors in v2.8.1
 
-Schema mismatch.
+When running interactively, only the status tag is colored. The timestamp and message remain in the terminal's default color.
 
-Reported and skipped unless:
+| Tag | Screen color |
+|---|---|
+| `START` | Light blue |
+| `SUCCESS` | Light green |
+| `WARNING` | Yellow |
+| `FAILED` | Light red |
+| `TIMEOUT` | Light red |
+| `INFO` | Default terminal color |
+| `PLAN` | Default terminal color |
+| `OUTPUT` | Default terminal color |
+| `SUMMARY` | Default terminal color |
+
+The ANSI reset is written immediately after the padded tag field, so the remaining message is not colored.
+
+## Summary and return code
+
+Every run ends with summary lines for:
+
+- Script version, mode, scope, and return code
+- Filesystem candidate files, directories, and bytes
+- ADR discovered, successful, failed, timed-out, and skipped totals
+- Database successful, failed, timed-out, and skipped totals
+- Log file location
+
+Any recorded failure sets the final return code to a nonzero value.
+
+## Recommended validation workflow
+
+### 1. Validate syntax
 
 ```bash
---allow-adr-schema-migration
+bash -n dba_ora_clean.sh
 ```
 
-is specified.
+### 2. Review help
 
-### Stale ADR Homes
+```bash
+./dba_ora_clean.sh --help
+```
 
-ADRCI may discover homes whose databases are no longer running.
+### 3. Run a full preflight
 
-This is expected and often desirable because old diagnostic data still needs cleanup.
+```bash
+./dba_ora_clean.sh --preflight
+```
 
----
+### 4. Validate each phase independently
 
-# Version History
+```bash
+./dba_ora_clean.sh --preflight --only filesystem
+./dba_ora_clean.sh --preflight --only oem
+./dba_ora_clean.sh --preflight --only adr
+./dba_ora_clean.sh --preflight --only database
+```
 
-| Version | Major Change |
-|----------|-------------|
-| 2.0 | Safety rewrite, locking, preflight, timeouts |
-| 2.1 | SID handling fixes |
-| 2.2 | Explicit ADRCI environment handling |
-| 2.3 | ADRCI semantic error detection and DB prechecks |
-| 2.4 | AUD$ retention fix using NUMTODSINTERVAL |
-| 2.5 | Active Oracle Home filtering and ADR allowlist |
-| 2.6 | Restored filesystem cleanup items |
-| 2.7 | AUDIT_FILE_DEST discovery via V$PARAMETER |
+### 5. Apply each phase independently - Option 1
 
----
+```bash
+./dba_ora_clean.sh --apply --only filesystem
+./dba_ora_clean.sh --apply --only oem
+./dba_ora_clean.sh --apply --only adr
+./dba_ora_clean.sh --apply --only database
+```
 
-# Author
+### 5. Run the complete cleanup - Option 2
 
-Parsa Bahrami
+```bash
+./dba_ora_clean.sh --apply
+```
 
-Original v1 framework was based on historical cleanup implementations from:
+### 6. Review the plain-text log
+
+Confirm that:
+
+- The expected active Oracle Homes were selected
+- `AUDIT_FILE_DEST` was resolved correctly for each database
+- ADR bases were not duplicated
+- SQL and ADRCI output is aligned
+- The log contains no ANSI escape sequences
+- Summary totals match the operations performed
+
+## Troubleshooting
+
+### Audit directory is skipped
+
+Confirm the database is running and the following query returns an absolute path:
+
+```sql
+SELECT value
+  FROM v$parameter
+ WHERE name = 'audit_file_dest';
+```
+
+### ADR permission errors
+
+Review ownership and permissions for the reported ADR home. Root-owned ADR homes may not be purgeable by the Oracle software owner.
+
+### Running SID is excluded
+
+Confirm that:
+
+- A PMON process exists
+- The SID has an uncommented `/etc/oratab` entry
+- The Oracle Home in `/etc/oratab` exists
+
+### Screen has no colors
+
+Colors appear only when standard output is attached to an interactive terminal. Also confirm that `NO_COLOR` is not set and `TERM` is not `dumb`.
+
+### Disable colors manually
+
+```bash
+NO_COLOR=1 ./dba_ora_clean.sh --preflight
+```
+
+## Version history
+
+| Version | Major change |
+|---|---|
+| 1.0 | Initial release |
+| 1.0.1 | Batched removal behavior |
+| 1.0.2 | Database alert-log rotation disabled |
+| 1.1 | ADR Home cleanup introduced |
+| 1.1.1 | ADRCI schema mismatch handling introduced |
+| 2.0 | Safety rewrite with preflight, locking, timeouts, and scoped execution |
+| 2.1 | Oracle environment loading and case-insensitive SID resolution corrected |
+| 2.2 | Explicit Oracle Home and Oracle Base environment for ADRCI |
+| 2.3 | ADRCI semantic error detection and exact database prechecks |
+| 2.4 | `SYS.AUD$` retention arithmetic corrected with `NUMTODSINTERVAL` |
+| 2.5 | Active Oracle Home filtering and ADR family allowlist |
+| 2.6 | Database OS audit, CRS EVM, and listener XML filesystem cleanup restored |
+| 2.7 | Database audit path resolved from `V$PARAMETER.AUDIT_FILE_DEST` |
+| 2.8 | SQL and ADRCI output aligned; screen-only status colors added |
+| 2.8.1 | Color limited to the status tag; informational tags use the default terminal color |
+
+## Author and credits
+
+**Author:** Parsa Bahrami
+
+The original v1.0 implementation was based on historical cleanup scripts by:
 
 - Wayne Sharp
 - Muthu Venguidassalame
 - M. Ali
+
+## Operational warning
+
+Always run preflight and review the selected Oracle Homes, resolved audit destinations, ADR bases, candidate counts, and log location before using `--apply` on a production server.
