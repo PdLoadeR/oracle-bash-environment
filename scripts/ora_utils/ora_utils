@@ -2,7 +2,7 @@
 #
 ##
 ## ora_utils - Bash functions for managing Oracle Databases on Linux
-## Version: 3.5.1
+## Version: 3.5.2
 ##
 ## Source this file from the Oracle software owner's .bashrc:
 ##
@@ -114,6 +114,12 @@
 #                             - dbprecheck --target accepts 19c, 26ai or a Release Update (target_os)
 #                             - New 19c installs on RHEL/OL 8: minimum RU 19.18 (_DBA_CERT_INSTALL_RU_19_el8)
 #  20261125    pb           Renamed to ora_utils for publishing (GitHub)
+#  20261125    pb           v3.5.2: lsmenu
+#                             - Orphaned = no controlling terminal (TTY '?') or parent exited (PID 1 / systemd);
+#                               v3.x only checked the parent, so menus left by dropped sessions were missed
+#                             - Exact command line match (parent shells are never matched or killed)
+#                             - New columns PARENT, STARTED, CPU_TIME, ORPHANED, REASON; sorted by CPU time
+#                             - New options --all, --pattern; return code 2 when orphans are found
 #
 # Bash 4.2 compatible: no namerefs, no 'wait -n'.
 
@@ -1303,32 +1309,62 @@ EOF
 
 # DESC: Identify and optionally kill orphaned 'menu' processes
 function lsmenu() {
-    local action="list" assume_yes=0 menu_user="oracle" pattern='/bin/sh ./menu'
+    local action="list" assume_yes=0 menu_user="oracle" pattern='/bin/sh ./menu' show_all=0
     local _o_mode="table" _o_nohdr=0 _o_grep="" _o_grepv="" _o_modes=0 _o_nocolor=0 _o_shift=1 rc
     while [[ $# -gt 0 ]]; do
         _dba_common_opt "$@"; rc=$?
         if (( rc == 0 )); then shift "$_o_shift"; continue; elif (( rc == 2 )); then return 1; fi
         case "$1" in
-            --kill)   action="kill" ;;
-            --yes|-y) assume_yes=1 ;;
-            --user)   _dba_need_val "$1" "${2-}" || return 1; menu_user="$2"; shift ;;
+            --kill)    action="kill" ;;
+            --yes|-y)  assume_yes=1 ;;
+            --all)     show_all=1 ;;
+            --user)    _dba_need_val "$1" "${2-}" || return 1; menu_user="$2"; shift ;;
+            --pattern) _dba_need_val "$1" "${2-}" || return 1; pattern="$2"; shift ;;
             -h|--help)
                 cat <<'EOF'
-Usage: lsmenu [--kill [--yes]] [--user USER] [--csv|--json|--raw] [--no-header]
+Usage: lsmenu [--all] [--kill [--yes]] [--user USER] [--pattern TEXT]
+              [--grep PATTERN] [--grep-v PATTERN] [--csv|--json|--raw] [--no-header] [--no-color]
 
 Identify and optionally kill orphaned 'menu' processes ('/bin/sh ./menu').
 
-A process is considered orphaned when its parent has exited, i.e. its parent
-PID is 1 or a 'systemd' process (systemd --user subreaper).
+A menu process is considered orphaned when:
+  - it has no controlling terminal (TTY '?'): the login session that started it is
+    gone (closed PuTTY window, dropped VPN, ssh timeout) - the usual case, even when
+    its parent shell still exists; or
+  - its parent has exited (parent PID 1 or a 'systemd' process).
+Menus whose session has ended often loop on the closed terminal and burn a full
+CPU each - check the CPU_TIME column.
+
+Columns: PID, PPID, PARENT (parent command), USER, TTY, STARTED, ELAPSED, CPU_TIME,
+         ORPHANED (YES/NO), REASON
+Rows are sorted by CPU_TIME, highest first.
 
 Options:
-  --kill        Kill the orphaned processes: SIGTERM first, then SIGKILL for any
-                process still alive after 5 seconds. Asks for confirmation.
-  --yes, -y     Do not ask for confirmation with --kill.
-  --user USER   Owner of the menu processes (default: oracle).
-  -h, --help    Display this help message.
+  --all             Also list menu processes that still have a terminal (ORPHANED = NO);
+                    --kill never touches those
+  --kill            Kill the orphaned processes: SIGTERM first, then SIGKILL for any
+                    process still alive after 5 seconds. Asks for confirmation.
+  --yes, -y         Do not ask for confirmation with --kill.
+  --user USER       Owner of the menu processes (default: oracle).
+  --pattern TEXT    Command line to look for (default: '/bin/sh ./menu'). The process
+                    command line must be exactly TEXT (optionally followed by arguments),
+                    so shells that merely mention it are never matched.
+  --grep / --grep-v, --csv|--json|--raw, --no-header, --no-color
+  -h, --help        Display this help message.
 
-Without --kill the orphaned processes are only listed.
+Notes:
+  - Only the menu processes are killed, never their parent shells.
+  - A menu started from cron, nohup or setsid also has no terminal and is listed as
+    orphaned - review the list before using --kill.
+
+Return code: 0 = none found or all killed, 2 = orphaned processes found (list mode),
+             1 = error or a process could not be killed
+
+Examples:
+  lsmenu
+  lsmenu --all
+  lsmenu --kill
+  lsmenu --kill --yes
 EOF
                 return 0
                 ;;
@@ -1341,29 +1377,55 @@ EOF
     done
     _dba_check_modes || return 1
 
-    local -a pids=()
-    local data="PID|PPID|USER|TTY|ELAPSED|COMMAND"
-    local pid ppid user tty etime args pcomm
-    while read -r pid ppid user tty etime args; do
-        [[ "$user" == "$menu_user" ]] || continue
-        [[ "$args" == *"$pattern"* ]] || continue
-        if [[ "$ppid" != "1" ]]; then
-            pcomm="$(ps -o comm= -p "$ppid" 2>/dev/null)"
-            [[ "$pcomm" == systemd* ]] || continue
-        fi
-        pids+=("$pid")
-        data+=$'\n'"$pid|$ppid|$user|$tty|$etime|$(_dba_clean "$args")"
-    done < <(ps -eo pid=,ppid=,user:32=,tty=,etime=,args=)
+    _lsmenu_secs() {    # [DD-]HH:MM:SS or MM:SS -> seconds
+        awk -v t="$1" 'BEGIN { d = 0; if (index(t, "-")) { split(t, x, "-"); d = x[1]; t = x[2] }
+                               n = split(t, a, ":"); s = 0; for (i = 1; i <= n; i++) s = s * 60 + a[i]
+                               print d * 86400 + s }'
+    }
 
-    if (( ${#pids[@]} == 0 )); then
+    local -a pids=()
+    local rows="" pid ppid user tty lstart etime cputime args pcomm orphan reason
+    local nfound=0
+    while read -r pid ppid user tty cputime etime args; do
+        [[ "$user" == "$menu_user" ]] || continue
+        # exact command line (plus optional arguments) - never parent shells that only mention it
+        [[ "$args" == "$pattern" || "$args" == "$pattern "* ]] || continue
+        pcomm="$(ps -o comm= -p "$ppid" 2>/dev/null)"
+        reason=""
+        [[ "$tty" == "?" || -z "$tty" ]] && reason="no terminal"
+        if [[ "$ppid" == "1" || "$pcomm" == systemd* ]]; then
+            reason="${reason:+$reason, }parent exited"
+        fi
+        if [[ -n "$reason" ]]; then
+            orphan="YES"
+            pids+=("$pid")
+            nfound=$(( nfound + 1 ))
+        else
+            orphan="NO"
+            reason="session active"
+            (( show_all )) || continue
+        fi
+        lstart="$(date -d "$(ps -o lstart= -p "$pid" 2>/dev/null)" '+%Y-%m-%d %H:%M' 2>/dev/null)"
+        rows+="$(_lsmenu_secs "$cputime")|$pid|$ppid|${pcomm:--}|$user|$tty|${lstart:--}|$etime|$cputime|$orphan|$reason"$'\n'
+    done < <(ps -eo pid=,ppid=,user:32=,tty=,time=,etime=,args=)
+
+    if [[ -z "$rows" ]]; then
         echo "No orphaned 'menu' processes found for user '$menu_user'."
         return 0
     fi
 
-    echo "Orphaned 'menu' processes found for user '$menu_user':"
+    local data="PID|PPID|PARENT|USER|TTY|STARTED|ELAPSED|CPU_TIME|ORPHANED|REASON"
+    data+=$'\n'"$(sort -t'|' -k1,1nr <<< "${rows%$'\n'}" | cut -d'|' -f2-)"
+
+    if (( nfound == 0 )); then
+        echo "No orphaned 'menu' processes found for user '$menu_user' (menus with an active session are listed below)."
+        _dba_emit "$data"
+        return 0
+    fi
+    echo "Orphaned 'menu' processes found for user '$menu_user': $nfound"
     _dba_emit "$data"
 
-    [[ "$action" == "kill" ]] || return 0
+    [[ "$action" == "kill" ]] || return 2
 
     if (( ! assume_yes )); then
         local answer
@@ -1371,7 +1433,7 @@ EOF
             _dba_err "Refusing to kill without a terminal. Re-run with --yes."
             return 1
         fi
-        read -r -p "Kill ${#pids[@]} process(es)? Type YES to continue: " answer
+        read -r -p "Kill ${#pids[@]} orphaned process(es)? Type YES to continue: " answer
         [[ "$answer" == "YES" ]] || { echo "Aborted."; return 1; }
     fi
 
