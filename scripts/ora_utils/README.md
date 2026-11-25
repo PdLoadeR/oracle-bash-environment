@@ -227,7 +227,7 @@ rc=1
 | `dbpurge` | Dry run unless `--execute`; asks for `YES`; never purges alert logs |
 | `emblackout` | `--reason` and `--duration` are mandatory, duration capped at 72 hours; asks for `YES`; `--dry-run` |
 | `lsemtgt --apply` | Shows every `emcli` command first and asks for `YES` |
-| `lsmenu --kill` | Asks for `YES`; SIGTERM before SIGKILL |
+| `lsmenu --kill` | Asks for `YES`; only orphaned menus (never parent shells or menus with an active session); SIGTERM before SIGKILL |
 | `dbblock --kill-sql` | Only prints the KILL SESSION statements |
 | `dbstats --flush` | The only write in the health functions - opt-in |
 
@@ -360,7 +360,7 @@ All are optional - the defaults work on a standard installation.
 |---|---|
 | [`passgen`](#passgen) | Generates strong random passwords. |
 | [`wclip`](#wclip) | Copies stdin to the Windows clipboard through a modified PuTTY / KiTTY (ANSI printer pass-through). |
-| [`lsmenu`](#lsmenu) | Finds orphaned `/bin/sh ./menu` processes (parent PID 1 or a systemd subreaper) and optionally kills them. |
+| [`lsmenu`](#lsmenu) | Finds `/bin/sh ./menu` processes left behind by closed sessions (no terminal, or parent exited) and optionally kills them. |
 
 ## Getting help
 
@@ -5875,69 +5875,150 @@ Sends stdin to the terminal using the ANSI printer pass-through sequence
 
 ### lsmenu
 
-Finds orphaned `/bin/sh ./menu` processes (parent PID 1 or a systemd subreaper) and optionally kills them.
+Finds `/bin/sh ./menu` processes left behind by closed sessions (no terminal, or parent exited) and optionally kills them.
 
 **Features**
 
-- `--user` (default oracle)
+- Orphaned = no controlling terminal (TTY `?`, the session that started it is gone - closed PuTTY window, dropped VPN, ssh timeout) **or** parent exited (PID 1 / systemd subreaper); the REASON column says which
+- Menus whose session ended often loop on the closed terminal and burn a full CPU each: rows are sorted by CPU_TIME, highest first
+- Exact command-line match - parent shells are never matched or killed
+- `--all` also lists menus that still have a terminal (ORPHANED = NO); `--kill` never touches those
 - `--kill` sends SIGTERM, then SIGKILL after 5 seconds; asks for YES unless `--yes`
+- `--user` (default oracle), `--pattern` for a different menu command line
+- Return code 2 when orphaned menus are found (list mode)
 
 **Usage**
 
 ```text
-lsmenu [--kill [--yes]] [--user USER] [--csv|--json|--raw] [--no-header]
+lsmenu [--all] [--kill [--yes]] [--user USER] [--pattern TEXT]
+       [--grep PATTERN] [--grep-v PATTERN] [--csv|--json|--raw] [--no-header] [--no-color]
 ```
 
 **Examples**
 
-**List orphaned `/bin/sh ./menu` processes**
+**Orphaned menus, busiest first (the first four have been spinning on a closed terminal for days)**
 
 ```text
 $ lsmenu
-Orphaned 'menu' processes found for user 'oracle':
-  +---------+--------+----------+-------+-----------+------------------+
-  |  PID    |  PPID  |  USER    |  TTY  |  ELAPSED  |  COMMAND         |
-  +---------+--------+----------+-------+-----------+------------------+
-  |  28340  |  1     |  oracle  |  ?    |  02:32    |  /bin/sh ./menu  |
-  |  28341  |  1     |  oracle  |  ?    |  02:32    |  /bin/sh ./menu  |
-  +---------+--------+----------+-------+-----------+------------------+
+Orphaned 'menu' processes found for user 'oracle': 6
+  +-----------+-----------+-----------+----------+-------+--------------------+---------------+------------+------------+------------------------------+
+  |  PID      |  PPID     |  PARENT   |  USER    |  TTY  |  STARTED           |  ELAPSED      |  CPU_TIME  |  ORPHANED  |  REASON                      |
+  +-----------+-----------+-----------+----------+-------+--------------------+---------------+------------+------------+------------------------------+
+  |  2210417  |  2210388  |  bash     |  oracle  |  ?    |  2026-11-04 09:12  |  20-22:10:41  |  20:05:22  |  YES       |  no terminal                 |
+  |  1402236  |  1402207  |  bash     |  oracle  |  ?    |  2026-11-05 07:40  |  19-23:42:03  |  19:01:49  |  YES       |  no terminal                 |
+  |  1755310  |  1755274  |  bash     |  oracle  |  ?    |  2026-11-05 10:02  |  19-21:20:15  |  18:48:22  |  YES       |  no terminal                 |
+  |  3021988  |  3021950  |  bash     |  oracle  |  ?    |  2026-11-09 13:55  |  15-17:27:09  |  14:40:20  |  YES       |  no terminal                 |
+  |  1610562  |  1        |  systemd  |  oracle  |  ?    |  2026-11-05 08:31  |  19-22:51:12  |  00:00:00  |  YES       |  no terminal, parent exited  |
+  |  1893745  |  1893702  |  bash     |  oracle  |  ?    |  2026-11-05 14:17  |  19-17:05:44  |  00:00:00  |  YES       |  no terminal                 |
+  +-----------+-----------+-----------+----------+-------+--------------------+---------------+------------+------------+------------------------------+
 ```
 
-**Kill them (SIGTERM, then SIGKILL after 5 seconds) without the YES prompt**
+**Also show menus whose session is still active**
 
 ```text
-$ lsmenu --kill --yes
-Orphaned 'menu' processes found for user 'oracle':
-  +---------+--------+----------+-------+-----------+------------------+
-  |  PID    |  PPID  |  USER    |  TTY  |  ELAPSED  |  COMMAND         |
-  +---------+--------+----------+-------+-----------+------------------+
-  |  28340  |  1     |  oracle  |  ?    |  02:32    |  /bin/sh ./menu  |
-  |  28341  |  1     |  oracle  |  ?    |  02:32    |  /bin/sh ./menu  |
-  +---------+--------+----------+-------+-----------+------------------+
-Terminated process ID: 28340 (SIGTERM)
-Terminated process ID: 28341 (SIGTERM)
-Total orphaned processes killed: 2
+$ lsmenu --all
+Orphaned 'menu' processes found for user 'oracle': 6
+  +-----------+-----------+-----------+----------+---------+--------------------+---------------+------------+------------+------------------------------+
+  |  PID      |  PPID     |  PARENT   |  USER    |  TTY    |  STARTED           |  ELAPSED      |  CPU_TIME  |  ORPHANED  |  REASON                      |
+  +-----------+-----------+-----------+----------+---------+--------------------+---------------+------------+------------+------------------------------+
+  |  2210417  |  2210388  |  bash     |  oracle  |  ?      |  2026-11-04 09:12  |  20-22:10:41  |  20:05:22  |  YES       |  no terminal                 |
+  |  1402236  |  1402207  |  bash     |  oracle  |  ?      |  2026-11-05 07:40  |  19-23:42:03  |  19:01:49  |  YES       |  no terminal                 |
+  |  1755310  |  1755274  |  bash     |  oracle  |  ?      |  2026-11-05 10:02  |  19-21:20:15  |  18:48:22  |  YES       |  no terminal                 |
+  |  3021988  |  3021950  |  bash     |  oracle  |  ?      |  2026-11-09 13:55  |  15-17:27:09  |  14:40:20  |  YES       |  no terminal                 |
+  |  1610562  |  1        |  systemd  |  oracle  |  ?      |  2026-11-05 08:31  |  19-22:51:12  |  00:00:00  |  YES       |  no terminal, parent exited  |
+  |  1893745  |  1893702  |  bash     |  oracle  |  ?      |  2026-11-05 14:17  |  19-17:05:44  |  00:00:00  |  YES       |  no terminal                 |
+  |  3355128  |  3355090  |  bash     |  oracle  |  pts/4  |  2026-11-25 08:02  |  00:21:38     |  00:00:00  |  NO        |  session active              |
+  +-----------+-----------+-----------+----------+---------+--------------------+---------------+------------+------------+------------------------------+
+```
+
+**Only menus whose parent shell has exited, as CSV**
+
+```text
+$ lsmenu --csv --grep 'no terminal, parent'
+Orphaned 'menu' processes found for user 'oracle': 6
+PID,PPID,PARENT,USER,TTY,STARTED,ELAPSED,CPU_TIME,ORPHANED,REASON
+1610562,1,systemd,oracle,?,2026-11-05 08:31,19-22:51:12,00:00:00,YES,"no terminal, parent exited"
+```
+
+**Kill them (asks for YES; SIGKILL for anything still alive after 5 seconds)**
+
+```text
+$ lsmenu --kill
+Orphaned 'menu' processes found for user 'oracle': 6
+  +-----------+-----------+-----------+----------+-------+--------------------+---------------+------------+------------+------------------------------+
+  |  PID      |  PPID     |  PARENT   |  USER    |  TTY  |  STARTED           |  ELAPSED      |  CPU_TIME  |  ORPHANED  |  REASON                      |
+  +-----------+-----------+-----------+----------+-------+--------------------+---------------+------------+------------+------------------------------+
+  |  2210417  |  2210388  |  bash     |  oracle  |  ?    |  2026-11-04 09:12  |  20-22:10:41  |  20:05:22  |  YES       |  no terminal                 |
+  |  1402236  |  1402207  |  bash     |  oracle  |  ?    |  2026-11-05 07:40  |  19-23:42:03  |  19:01:49  |  YES       |  no terminal                 |
+  |  1755310  |  1755274  |  bash     |  oracle  |  ?    |  2026-11-05 10:02  |  19-21:20:15  |  18:48:22  |  YES       |  no terminal                 |
+  |  3021988  |  3021950  |  bash     |  oracle  |  ?    |  2026-11-09 13:55  |  15-17:27:09  |  14:40:20  |  YES       |  no terminal                 |
+  |  1610562  |  1        |  systemd  |  oracle  |  ?    |  2026-11-05 08:31  |  19-22:51:12  |  00:00:00  |  YES       |  no terminal, parent exited  |
+  |  1893745  |  1893702  |  bash     |  oracle  |  ?    |  2026-11-05 14:17  |  19-17:05:44  |  00:00:00  |  YES       |  no terminal                 |
+  +-----------+-----------+-----------+----------+-------+--------------------+---------------+------------+------------+------------------------------+
+Kill 6 orphaned process(es)? Type YES to continue: YES
+Terminated process ID: 1402236 (SIGTERM)
+Terminated process ID: 1610562 (SIGTERM)
+Terminated process ID: 1755310 (SIGTERM)
+Terminated process ID: 2210417 (SIGTERM)
+Terminated process ID: 3021988 (SIGTERM)
+Killed process ID: 1893745 (SIGKILL)
+Total orphaned processes killed: 6
+```
+
+**Nothing left to clean up**
+
+```text
+$ lsmenu
+No orphaned 'menu' processes found for user 'oracle'.
 ```
 
 <details>
 <summary>Full <code>lsmenu --help</code></summary>
 
 ```text
-Usage: lsmenu [--kill [--yes]] [--user USER] [--csv|--json|--raw] [--no-header]
+Usage: lsmenu [--all] [--kill [--yes]] [--user USER] [--pattern TEXT]
+              [--grep PATTERN] [--grep-v PATTERN] [--csv|--json|--raw] [--no-header] [--no-color]
 
 Identify and optionally kill orphaned 'menu' processes ('/bin/sh ./menu').
 
-A process is considered orphaned when its parent has exited, i.e. its parent
-PID is 1 or a 'systemd' process (systemd --user subreaper).
+A menu process is considered orphaned when:
+  - it has no controlling terminal (TTY '?'): the login session that started it is
+    gone (closed PuTTY window, dropped VPN, ssh timeout) - the usual case, even when
+    its parent shell still exists; or
+  - its parent has exited (parent PID 1 or a 'systemd' process).
+Menus whose session has ended often loop on the closed terminal and burn a full
+CPU each - check the CPU_TIME column.
+
+Columns: PID, PPID, PARENT (parent command), USER, TTY, STARTED, ELAPSED, CPU_TIME,
+         ORPHANED (YES/NO), REASON
+Rows are sorted by CPU_TIME, highest first.
 
 Options:
-  --kill        Kill the orphaned processes: SIGTERM first, then SIGKILL for any
-                process still alive after 5 seconds. Asks for confirmation.
-  --yes, -y     Do not ask for confirmation with --kill.
-  --user USER   Owner of the menu processes (default: oracle).
-  -h, --help    Display this help message.
+  --all             Also list menu processes that still have a terminal (ORPHANED = NO);
+                    --kill never touches those
+  --kill            Kill the orphaned processes: SIGTERM first, then SIGKILL for any
+                    process still alive after 5 seconds. Asks for confirmation.
+  --yes, -y         Do not ask for confirmation with --kill.
+  --user USER       Owner of the menu processes (default: oracle).
+  --pattern TEXT    Command line to look for (default: '/bin/sh ./menu'). The process
+                    command line must be exactly TEXT (optionally followed by arguments),
+                    so shells that merely mention it are never matched.
+  --grep / --grep-v, --csv|--json|--raw, --no-header, --no-color
+  -h, --help        Display this help message.
 
-Without --kill the orphaned processes are only listed.
+Notes:
+  - Only the menu processes are killed, never their parent shells.
+  - A menu started from cron, nohup or setsid also has no terminal and is listed as
+    orphaned - review the list before using --kill.
+
+Return code: 0 = none found or all killed, 2 = orphaned processes found (list mode),
+             1 = error or a process could not be killed
+
+Examples:
+  lsmenu
+  lsmenu --all
+  lsmenu --kill
+  lsmenu --kill --yes
 ```
 
 </details>
@@ -5991,8 +6072,8 @@ Functions whose name starts with `_dba_` are internal.
 
 ## About the examples
 
-The example outputs in this README were produced by running ora_utils 3.5.1 against a lab host with fictitious data: Grid Infrastructure 19.32 (Oracle Restart with ASM), the databases FINPRD (19c CDB with two PDBs and two standbys), HRPRD (19c non-CDB still running from the 19.31 home after an out-of-place patch), CRMSTBY (mounted physical standby), AIDEV (26ai CDB) and DWTST (down), an OEM 13.5 agent and GoldenGate 21c Microservices. Dates, sizes and identifiers will of course differ on your systems.
+The example outputs in this README were produced by running ora_utils 3.5.2 against a lab host with fictitious data: Grid Infrastructure 19.32 (Oracle Restart with ASM), the databases FINPRD (19c CDB with two PDBs and two standbys), HRPRD (19c non-CDB still running from the 19.31 home after an out-of-place patch), CRMSTBY (mounted physical standby), AIDEV (26ai CDB) and DWTST (down), an OEM 13.5 agent and GoldenGate 21c Microservices. Dates, sizes and identifiers will of course differ on your systems.
 
 ## Author
 
-Parsa Bahrami
+Parsa Bahrami - [parsabahrami.com](https://parsabahrami.com/) - [nightowldbre.com](https://nightowldbre.com/)
